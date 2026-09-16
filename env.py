@@ -3,5 +3,12 @@ import gymnasium as gym
 env = gym.make("MountainCar-v0", render_mode="human")
 
 obs, info = env.reset()
-print('X-axis position: ', obs[0])
-print('Initial velocity: ', obs[1])
+
+for step in range(200):
+    action = env.action_space.sample()
+    obs, reward, terminated, truncated, info = env.step(action)
+
+    if terminated or truncated:
+        obs, info = env.reset()
+
+env.close()
