@@ -1,14 +1,12 @@
 import gymnasium as gym
+from stable_baselines3 import PPO
 
 env = gym.make("MountainCar-v0", render_mode="human")
 
-obs, info = env.reset()
 
-for step in range(200):
-    action = env.action_space.sample()
-    obs, reward, terminated, truncated, info = env.step(action)
+model = PPO("MlpPolicy", env, verbose=1)
 
-    if terminated or truncated:
-        obs, info = env.reset()
+model.learn(total_timesteps=100_000)
 
+model.save("mountain_car_ppo")
 env.close()
