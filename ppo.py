@@ -41,13 +41,14 @@ def collect(env, n_steps=2048, obs=None):
         obs, _ = env.reset()
 
     buf = {k: [] for k in
-           ("obs", "actions", "logps", "values", "rewards", "terminated", "truncated")}
+           ("obs", "next_obs", "actions", "logps", "values", "rewards", "terminated", "truncated")}
 
     for _ in range(n_steps):
         action, logp, value = act(obs)
         next_obs, reward, terminated, truncated, _ = env.step(action)
 
         buf["obs"].append(obs)
+        buf["next_obs"].append(next_obs)   # the real landing spot, not the post-reset one
         buf["actions"].append(action)
         buf["logps"].append(logp)
         buf["values"].append(value)
@@ -61,6 +62,30 @@ def collect(env, n_steps=2048, obs=None):
 
     # obs is handed back so the next rollout continues the episode instead of restarting it
     return {k: np.array(v) for k, v in buf.items()}, obs
+
+
+def advantages(batch, gamma=0.99, lam=0.95):
+    """GAE: how much better each action turned out than the critic expected."""
+    rewards, values = batch["rewards"], batch["values"]
+
+    # critic's guess for the state each step landed in; zero once the flag is reached
+    next_values = model(batch["next_obs"])[1][:, 0].numpy()
+    next_values = np.where(batch["terminated"], 0.0, next_values)
+
+    # surprise at each step: what we actually got vs. what we expected to get
+    deltas = rewards + gamma * next_values - values
+
+    adv = np.zeros_like(deltas)
+    running = 0.0
+    for t in reversed(range(len(deltas))):           # backwards: the future is known first
+        if batch["terminated"][t] or batch["truncated"][t]:
+            running = 0.0                            # never blend across an episode boundary
+        running = deltas[t] + gamma * lam * running
+        adv[t] = running
+
+    returns = adv + values                           # the critic's training target
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)    # normalize: keeps updates from exploding
+    return adv.astype(np.float32), returns.astype(np.float32)
 
 
 if __name__ == "__main__":
@@ -91,3 +116,17 @@ if __name__ == "__main__":
     print("collect() ok:", len(batch["obs"]), "steps,",
           int(batch["terminated"].sum()), "reached the flag,",
           int(batch["truncated"].sum()), "timed out")
+
+    adv, returns = advantages(batch)
+    assert adv.shape == returns.shape == (250,), adv.shape
+    assert np.isfinite(adv).all() and np.isfinite(returns).all()
+    assert abs(adv.mean()) < 1e-5 and abs(adv.std() - 1) < 1e-5
+
+    # lam=0 makes GAE collapse to the one-step surprise, which we can recompute independently
+    nv = np.where(batch["terminated"], 0.0, model(batch["next_obs"])[1][:, 0].numpy())
+    deltas = batch["rewards"] + 0.99 * nv - batch["values"]
+    expected = (deltas - deltas.mean()) / (deltas.std() + 1e-8)
+    assert np.allclose(advantages(batch, lam=0.0)[0], expected, atol=1e-5)
+    print("advantages() ok: mean", round(float(adv.mean()), 6),
+          "std", round(float(adv.std()), 4),
+          "| returns range", round(float(returns.min()), 2), "to", round(float(returns.max()), 2))
