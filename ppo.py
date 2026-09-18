@@ -97,15 +97,8 @@ def advantages(batch, gamma=0.99, lam=0.95):
     return adv.astype(np.float32), returns.astype(np.float32)
 
 
-# ponytail: eager, not @tf.function - ~3x slower but no retracing surprises.
-# Wrap it once the training loop is the bottleneck.
-def train_step(obs, actions, old_logps, adv, returns,
-               clip=0.2, vf_coef=0.5, ent_coef=0.01):
-    """One gradient update on a minibatch: clipped policy loss + value loss + entropy bonus."""
-    obs = tf.cast(obs, tf.float32)
-    actions = tf.cast(actions, tf.int32)
-    old_logps, adv, returns = (tf.cast(x, tf.float32) for x in (old_logps, adv, returns))
-
+@tf.function(reduce_retracing=True)
+def _update(obs, actions, old_logps, adv, returns, clip, vf_coef, ent_coef):
     with tf.GradientTape() as tape:
         logits, values = model(obs)
         logp_all = tf.nn.log_softmax(logits)
@@ -125,7 +118,17 @@ def train_step(obs, actions, old_logps, adv, returns,
     grads = tape.gradient(loss, model.trainable_variables)
     grads, _ = tf.clip_by_global_norm(grads, 0.5)     # one more brake on runaway updates
     optimizer.apply_gradients(zip(grads, model.trainable_variables))
-    return float(policy_loss), float(value_loss), float(entropy)
+    return policy_loss, value_loss, entropy
+
+
+def train_step(obs, actions, old_logps, adv, returns,
+               clip=0.2, vf_coef=0.5, ent_coef=0.01):
+    """One gradient update on a minibatch: clipped policy loss + value loss + entropy bonus."""
+    losses = _update(tf.cast(obs, tf.float32),
+                     tf.cast(actions, tf.int32),
+                     *(tf.cast(x, tf.float32) for x in (old_logps, adv, returns)),
+                     clip, vf_coef, ent_coef)
+    return tuple(float(x) for x in losses)
 
 
 def train(env, iterations=40, n_steps=1024, epochs=10, batch_size=64):
