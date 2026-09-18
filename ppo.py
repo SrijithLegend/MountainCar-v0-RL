@@ -6,7 +6,44 @@ import tensorflow as tf
 
 ENV_ID = "CartPole-v1"          # swap to "MountainCar-v0" once the loop is proven
 
+
+class ShapeReward(gym.Wrapper):
+    """Potential-based shaping: reward += gamma * phi(next) - phi(now).
+
+    MountainCar pays a flat -1 until the flag, which random driving never reaches,
+    so there is nothing to learn from. This pays out for building momentum instead.
+    The gamma*phi(next) - phi(now) form is what makes it safe: over an episode the
+    bonuses telescope and cancel, so the best policy is unchanged (Ng et al. 1999).
+    An ad-hoc bonus would instead teach the car to farm the bonus forever.
+    """
+
+    def __init__(self, env, gamma=0.99, scale=100.0):
+        super().__init__(env)
+        self.gamma, self.scale = gamma, scale
+        self.prev = None
+
+    def potential(self, obs):
+        _position, velocity = obs
+        # speed in either direction: the car must roll backwards first to build momentum,
+        # so rewarding height alone would punish the one move that actually works
+        return self.scale * abs(velocity)
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        self.prev = obs
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        info["raw_reward"] = reward
+        reward += self.gamma * self.potential(obs) - self.potential(self.prev)
+        self.prev = obs
+        return obs, reward, terminated, truncated, info
+
+
 env = gym.make(ENV_ID)
+if "MountainCar" in ENV_ID:
+    env = ShapeReward(env)
 OBS_DIM = env.observation_space.shape[0]
 N_ACTIONS = int(env.action_space.n)   # numpy int; keras wants a plain int
 
@@ -150,9 +187,10 @@ def train(env, iterations=40, n_steps=1024, epochs=10, batch_size=64):
         # approximate: ignores the partial episode at each end of the rollout
         finished = int((batch["terminated"] | batch["truncated"]).sum())
         ep_return = batch["rewards"].sum() / max(finished, 1)
+        solved = int(batch["terminated"].sum())      # MountainCar: times the flag was reached
         history.append(ep_return)
-        print(f"iter {i:3d} | return {ep_return:8.1f} | value loss {vl:8.2f} | entropy {ent:.3f}",
-              flush=True)
+        print(f"iter {i:3d} | return {ep_return:8.1f} | solved {solved:3d} "
+              f"| value loss {vl:8.2f} | entropy {ent:.3f}", flush=True)
 
     return history
 
@@ -214,5 +252,18 @@ if __name__ == "__main__":
     assert vl2 < vl, (vl, vl2)                        # critic must fit the returns it was handed
     print("train_step() ok: value loss", round(vl, 3), "->", round(vl2, 3),
           "| entropy", round(ent, 3))
+    shaped = ShapeReward(gym.make("MountainCar-v0"))
+    fast, slow = np.array([-0.5, 0.05]), np.array([-0.5, 0.0])
+    assert shaped.potential(fast) > shaped.potential(slow)     # moving beats sitting still
+    assert shaped.potential(np.array([-0.5, -0.05])) == shaped.potential(fast)  # direction-blind
+
+    shaped.reset(seed=0)
+    rewards = [shaped.step(shaped.action_space.sample())[1] for _ in range(200)]
+    assert not all(r == -1.0 for r in rewards)                 # shaping must actually do something
+    assert max(abs(r) for r in rewards) < 20                   # but not drown out the -1 per step
+    shaped.close()
+    print("ShapeReward() ok: reward range",
+          round(min(rewards), 3), "to", round(max(rewards), 3))
+
     env.close()
     print(f"all checks pass on {ENV_ID}. run `python ppo.py --train` to train.")
